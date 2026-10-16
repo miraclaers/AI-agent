@@ -1,6 +1,9 @@
+import { z } from "zod";
+
 import { getApiKeyFromEnv } from "../lib/client-factory.ts";
 import type { ImageDownloadOptions } from "../lib/image-download.ts";
 import { downloadImagesAsBase64 } from "../lib/image-download.ts";
+import { MuxAiError } from "../lib/mux-ai-error.ts";
 import {
   getAssetDurationSecondsFromAsset,
   getPlaybackIdForAsset,
@@ -15,7 +18,8 @@ import { signUrl } from "../lib/url-signing.ts";
 import { resolveMuxSigningContext } from "../lib/workflow-credentials.ts";
 import { hasWorkflowScopeBoundaries, resolveWorkflowScope } from "../lib/workflow-scope.ts";
 import { getThumbnailUrls } from "../primitives/thumbnails.ts";
-import { fetchTranscriptForAsset } from "../primitives/transcripts.ts";
+import type { VTTCue } from "../primitives/transcripts.ts";
+import { buildTranscriptUrl, fetchTranscriptDataForUrl, findCaptionTrack, parseVTTCues } from "../primitives/transcripts.ts";
 import type {
   ImageSubmissionMode,
   ScopedMuxAIOptions,
@@ -27,10 +31,10 @@ import type {
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Per-thumbnail moderation result returned from `getModerationScores`. */
+/** Per-thumbnail (image) moderation result returned from `getModerationScores`. */
 export interface ThumbnailModerationScore {
   url: string;
-  /** Time in seconds of the thumbnail within the video. Absent for transcript moderation entries. */
+  /** Time in seconds of the thumbnail within the video. */
   time?: number;
   sexual: number;
   violence: number;
@@ -38,14 +42,93 @@ export interface ThumbnailModerationScore {
   errorMessage?: string;
 }
 
+/** Per-time-window transcript moderation result returned from `getModerationScores`. */
+export interface TranscriptModerationScore {
+  /** Seconds — start of the moderated time window (first cue's start time). */
+  startTime: number;
+  /** Seconds — end of the moderated time window (last cue's end time). */
+  endTime: number;
+  sexual: number;
+  violence: number;
+  error: boolean;
+  errorMessage?: string;
+}
+
+/**
+ * Outcome of moderating one surface (thumbnails or transcript) of an asset.
+ * Lets callers audit whether a surface was moderated or skipped (and why),
+ * instead of inferring it from an empty scores array.
+ */
+export interface ModerationSurfaceStatus<Reason extends string> {
+  /**
+   * - `"completed"` — moderation ran and at least one item was scored
+   *   (individual items may still carry a per-item `error`).
+   * - `"skipped"` — nothing could be moderated on this surface;
+   *   see {@link skipReason} / {@link skipMessage}.
+   * - `"failed"` — moderation ran but every item errored, so this surface
+   *   contributed no scores; see {@link errorMessage}. The result is still
+   *   returned when the other surface succeeded, with
+   *   `coverage.isLowConfidence` set.
+   */
+  status: "completed" | "skipped" | "failed";
+  /** Present only when `status === "skipped"`. Machine-readable reason. */
+  skipReason?: Reason;
+  /** Present only when `status === "skipped"`. Human-readable explanation. */
+  skipMessage?: string;
+  /** Present only when `status === "failed"`. Summarizes the per-item errors. */
+  errorMessage?: string;
+}
+
+/**
+ * Why thumbnail moderation was skipped:
+ * - `"no_video_track"` — the asset has no video track, so there are no thumbnails.
+ * - `"no_video_in_scope"` — the asset has a video track, but the requested
+ *   `scope` lies entirely past its end (trailing non-video media).
+ */
+export type ThumbnailModerationSkipReason = "no_video_track" | "no_video_in_scope";
+
+/**
+ * Why transcript moderation was skipped:
+ * - `"no_ready_text_track"` — no ready caption/subtitle track (or none
+ *   matching `languageCode`).
+ * - `"no_cues"` — a track exists but produced nothing to moderate: the VTT
+ *   body was empty, had no parseable cues, or no cue fell inside `scope`.
+ *   Treated as valid-but-empty, not as an error.
+ * - `"unsupported_provider"` — the selected provider is image-only.
+ */
+export type TranscriptModerationSkipReason =
+  | "no_ready_text_track" |
+  "no_cues" |
+  "unsupported_provider";
+
+export type ThumbnailModerationStatus = ModerationSurfaceStatus<ThumbnailModerationSkipReason>;
+export type TranscriptModerationStatus = ModerationSurfaceStatus<TranscriptModerationSkipReason>;
+
 /** Aggregated moderation payload returned from `getModerationScores`. */
 export interface ModerationResult {
   assetId: string;
-  /** Whether moderation ran on thumbnails (video) or transcript text (audio-only). */
-  mode: "thumbnails" | "transcript";
-  /** Convenience flag so callers can understand why `thumbnailScores` may contain a transcript entry. */
+  /**
+   * Which surfaces were actually moderated (derived from `thumbnailModeration`
+   * and `transcriptModeration`):
+   * - `"thumbnails"`: only image thumbnails.
+   * - `"transcript"`: only transcript text.
+   * - `"combined"`: both.
+   */
+  mode: "thumbnails" | "transcript" | "combined";
+  /** Convenience flag indicating the asset has no video track. */
   isAudioOnly: boolean;
+  /** Image (thumbnail) moderation results. Empty unless `thumbnailModeration.status` is `"completed"`. */
   thumbnailScores: ThumbnailModerationScore[];
+  /**
+   * Transcript moderation results, one entry per moderated time window
+   * (each carries `startTime`/`endTime`). Empty unless
+   * `transcriptModeration.status` is `"completed"`.
+   */
+  transcriptScores: TranscriptModerationScore[];
+  /** Audit trail for the thumbnail surface: completed, skipped (and why), or failed (and why). */
+  thumbnailModeration: ThumbnailModerationStatus;
+  /** Audit trail for the transcript surface: completed, skipped (and why), or failed (and why). */
+  transcriptModeration: TranscriptModerationStatus;
   /** Coverage metadata describing how many requested moderation samples actually succeeded. */
   coverage: {
     requestedSampleCount: number;
@@ -53,12 +136,15 @@ export interface ModerationResult {
     failedSampleCount: number;
     /** Fraction of requested samples that produced a usable moderation result. */
     sampleCoverage: number;
-    /** True when at least one sample failed but the workflow still returned a result. */
+    /**
+     * True when at least one thumbnail or transcript window failed but the
+     * workflow still returned a result.
+     */
     isPartial: boolean;
     /**
-     * True when threshold interpretation should be treated cautiously.
-     * For thumbnail moderation, this means we either covered less than half of planned samples
-     * or ended up with fewer than 3 successful thumbnails.
+     * True when threshold interpretation should be treated cautiously: fewer
+     * than half of the planned thumbnails (or fewer than 3) succeeded, or a
+     * surface that ran failed entirely.
      */
     isLowConfidence: boolean;
   };
@@ -96,8 +182,8 @@ export interface ModerationOptions extends ScopedMuxAIOptions {
   /** OpenAI moderation model identifier (defaults to 'omni-moderation-latest'). */
   model?: string;
   /**
-   * Optional transcript language code used when moderating audio-only assets.
-   * If omitted, the first ready text track will be used.
+   * Language code of the caption track to moderate. If omitted, an English
+   * subtitles track is preferred and otherwise the first ready text track is used.
    */
   languageCode?: string;
   /** Override the default sexual/violence thresholds (0-1). */
@@ -135,6 +221,39 @@ const OPENAI_MODERATION_BASE_DELAY_MS = 750;
 const OPENAI_MODERATION_MAX_DELAY_MS = 3000;
 const MIN_SAMPLE_COVERAGE_FOR_CONFIDENT_THRESHOLDING = 0.5;
 const MIN_SUCCESSFUL_THUMBNAILS_FOR_CONFIDENT_THRESHOLDING = 3;
+
+/**
+ * Default tuning for transcript time-windowing. Window SIZE scales with the
+ * asset's duration and consecutive windows OVERLAP so abuse straddling a
+ * boundary is still scored intact in at least one window:
+ *
+ *   windowSeconds  = clamp(duration / targetWindowCount, minWindowSeconds, maxWindowSeconds)
+ *   overlapSeconds = max(minOverlapSeconds, windowSeconds * overlapFraction)
+ *   stride         = max(windowSeconds - overlapSeconds, 1)
+ *
+ * Exported so callers can approximate window count from duration alone (e.g. for a
+ * pre-flight cost estimate before fetching/parsing the real transcript).
+ */
+export const DEFAULT_TRANSCRIPT_WINDOWING = {
+  targetWindowCount: 40,
+  minWindowSeconds: 20,
+  maxWindowSeconds: 120,
+  overlapFraction: 0.15,
+  minOverlapSeconds: 5,
+} as const;
+
+/**
+ * Maximum number of UTF-16 code units of concatenated cue text we send to
+ * OpenAI's moderation endpoint per BATCH request. OpenAI's moderation API
+ * accepts an array `input` and returns one `results[]` entry per element with
+ * no documented array-length cap — the real bound is the model's context
+ * window — so we batch multiple windows per request and cap the combined
+ * character budget conservatively.
+ */
+const TRANSCRIPT_BATCH_MAX_UTF16_CODE_UNITS = 100_000;
+
+/** Maximum number of window texts packed into a single batched moderation request. */
+const TRANSCRIPT_BATCH_MAX_ITEMS = 100;
 
 const GOOGLE_VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate";
 
@@ -229,15 +348,35 @@ function parseOpenAIModerationResponse(
   }
 }
 
+/**
+ * The parts of an OpenAI `/v1/moderations` response this workflow reads. The
+ * structure must match and `results` must be index-aligned with `input` (one
+ * result per item); a category missing from `category_scores` is read as 0
+ * (the model did not flag it).
+ */
+const OpenAIModerationResponseSchema = z.object({
+  results: z.array(z.object({
+    category_scores: z.object({
+      sexual: z.number().finite().nullish(),
+      violence: z.number().finite().nullish(),
+    }),
+  })),
+});
+
+type OpenAIModerationResponse = z.infer<typeof OpenAIModerationResponseSchema>;
+
 async function callOpenAIModerationApi({
   model,
   input,
   credentials,
 }: {
   model: string;
-  input: string | Array<{ type: "image_url"; image_url: { url: string } }>;
+  input:
+    | string |
+    string[] |
+    Array<{ type: "image_url"; image_url: { url: string } }>;
   credentials?: WorkflowCredentialsInput;
-}): Promise<any> {
+}): Promise<OpenAIModerationResponse> {
   "use step";
   const apiKey = await getApiKeyFromEnv("openai", credentials);
 
@@ -277,7 +416,21 @@ async function callOpenAIModerationApi({
         );
       }
 
-      return json;
+      const parsed = OpenAIModerationResponseSchema.safeParse(json);
+      if (!parsed.success) {
+        throw new OpenAIModerationRequestError(
+          `OpenAI moderation returned an unexpected response shape: ${compactBodySnippet(bodyText)}`,
+          { status: res.status, retriable: false },
+        );
+      }
+      const expectedResultCount = Array.isArray(input) ? input.length : 1;
+      if (parsed.data.results.length !== expectedResultCount) {
+        throw new OpenAIModerationRequestError(
+          `OpenAI moderation returned ${parsed.data.results.length} result(s) for ${expectedResultCount} input(s).`,
+          { status: res.status, retriable: false },
+        );
+      }
+      return parsed.data;
     },
     {
       maxRetries: OPENAI_MODERATION_MAX_RETRIES,
@@ -316,7 +469,7 @@ async function moderateImageWithOpenAI(entry: {
 }): Promise<ThumbnailModerationScore> {
   "use step";
   try {
-    const json: any = await callOpenAIModerationApi({
+    const { results } = await callOpenAIModerationApi({
       model: entry.model,
       input: [
         {
@@ -328,13 +481,13 @@ async function moderateImageWithOpenAI(entry: {
       ],
       credentials: entry.credentials,
     });
-    const categoryScores = json.results?.[0]?.category_scores || {};
+    const [result] = results;
 
     return {
       url: entry.url,
       time: entry.time,
-      sexual: categoryScores.sexual || 0,
-      violence: categoryScores.violence || 0,
+      sexual: result.category_scores.sexual ?? 0,
+      violence: result.category_scores.violence ?? 0,
       error: false,
     };
   } catch (error) {
@@ -372,80 +525,322 @@ async function requestOpenAIModeration(
   return processConcurrently(targetUrls, moderateImageWithOpenAI, maxConcurrent);
 }
 
-async function requestOpenAITextModeration(
-  text: string,
-  model: string,
-  url: string,
-  credentials?: WorkflowCredentialsInput,
-): Promise<ThumbnailModerationScore> {
-  "use step";
-  try {
-    const json: any = await callOpenAIModerationApi({
-      model,
-      input: text,
-      credentials,
-    });
-    const categoryScores = json.results?.[0]?.category_scores || {};
+/**
+ * Hard ceiling on the UTF-16 code units of a SINGLE window's concatenated cue
+ * text. The dynamic, duration-driven windowing below is the primary driver of
+ * window size; this constant is only a rare safety guard so a single window
+ * built over a very dense stretch of speech can never exceed the moderation
+ * input budget. Such a window is split into sub-windows under the cap (cues
+ * stay atomic), each carrying its own cue span as `[startTime, endTime]`.
+ */
+const TRANSCRIPT_WINDOW_MAX_UTF16_CODE_UNITS = 10_000;
 
-    return {
-      url,
-      sexual: categoryScores.sexual || 0,
-      violence: categoryScores.violence || 0,
-      error: false,
-    };
-  } catch (error) {
-    console.error("OpenAI text moderation failed:", error);
-    return {
-      url,
-      sexual: 0,
-      violence: 0,
-      error: true,
-      errorMessage: error instanceof Error ? error.message : String(error),
-    };
-  }
+/** A time-bounded window of transcript text built from caption cues. */
+interface TranscriptWindow {
+  startTime: number;
+  endTime: number;
+  text: string;
 }
 
-function chunkTextByUtf16CodeUnits(text: string, maxUnits: number): string[] {
-  if (!text.trim()) {
+function describeSurfaceFailure(
+  itemLabel: string,
+  scores: ReadonlyArray<{ error?: boolean; errorMessage?: string }>,
+): string {
+  const messages = Array.from(new Set(scores.map(s => s.errorMessage || "Unknown error")));
+  return `All ${scores.length} ${itemLabel}(s) failed to moderate: ${messages.join("; ")}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * Split a window's cues into sub-windows whose joined text stays under
+ * {@link TRANSCRIPT_WINDOW_MAX_UTF16_CODE_UNITS}. Cues are never split; each
+ * emitted sub-window carries its own cue span as `[startTime, endTime]`.
+ *
+ * A single cue whose text alone already exceeds the cap is emitted as its own
+ * sub-window and sent as-is, so the timecodes stay accurate. If it is large
+ * enough for the provider to reject, that window scores as an error.
+ */
+function splitCuesUnderCharCeiling(
+  cues: VTTCue[],
+  maxUnits: number = TRANSCRIPT_WINDOW_MAX_UTF16_CODE_UNITS,
+): TranscriptWindow[] {
+  const windows: TranscriptWindow[] = [];
+  let current: VTTCue[] = [];
+  let currentLength = 0;
+
+  const flush = () => {
+    if (current.length === 0) {
+      return;
+    }
+    windows.push({
+      startTime: Math.min(...current.map(cue => cue.startTime)),
+      endTime: Math.max(...current.map(cue => cue.endTime)),
+      text: current.map(cue => cue.text).join(" "),
+    });
+    current = [];
+    currentLength = 0;
+  };
+
+  for (const cue of cues) {
+    const cueText = cue.text;
+    // +1 accounts for the space joiner between cues.
+    const addedLength = currentLength === 0 ? cueText.length : currentLength + 1 + cueText.length;
+    if (current.length > 0 && addedLength > maxUnits) {
+      flush();
+    }
+    current.push(cue);
+    currentLength = current.length === 1 ? cueText.length : currentLength + 1 + cueText.length;
+  }
+  flush();
+
+  return windows;
+}
+
+/**
+ * Build DYNAMIC, OVERLAPPING transcript windows from timestamped caption cues.
+ *
+ * Window SIZE scales with the asset's `duration` and consecutive windows
+ * OVERLAP so abuse straddling a window boundary is still scored intact in at
+ * least one window:
+ *
+ *   windowSeconds  = clamp(duration / targetWindowCount, minWindowSeconds, maxWindowSeconds)
+ *   overlapSeconds = max(minOverlapSeconds, windowSeconds * overlapFraction)
+ *   stride         = max(windowSeconds - overlapSeconds, 1)   // never <= 0
+ *
+ * Window k covers the time interval `[k*stride, k*stride + windowSeconds]`. A
+ * cue belongs to window k when it intersects that interval, so boundary cues
+ * appear in both neighbouring windows. Empty windows (gaps of silence) are
+ * skipped, and two consecutive windows containing the exact same cue set are
+ * deduped to avoid a redundant request. A window whose joined text would exceed
+ * {@link TRANSCRIPT_WINDOW_MAX_UTF16_CODE_UNITS} is split into sub-windows under
+ * the cap as a rare safety guard.
+ *
+ * NOTE: because windows overlap by design, consecutive windows' reported
+ * `[startTime, endTime]` ranges may overlap by ~`overlapSeconds`.
+ *
+ * Exported for direct unit testing without network access.
+ */
+export function buildTranscriptWindows(
+  cues: VTTCue[],
+  duration: number,
+): TranscriptWindow[] {
+  const usableCues = cues
+    .filter(cue => cue.text.trim().length > 0)
+    .slice()
+    .sort((a, b) => a.startTime - b.startTime);
+  if (usableCues.length === 0) {
     return [];
   }
-  if (text.length <= maxUnits) {
-    return [text];
-  }
-  const chunks: string[] = [];
-  for (let i = 0; i < text.length; i += maxUnits) {
-    const chunk = text.slice(i, i + maxUnits).trim();
-    if (chunk) {
-      chunks.push(chunk);
+
+  const lastCueEnd = Math.max(...usableCues.map(cue => cue.endTime));
+  // Fall back to the last cue's end time when the asset duration is missing/0.
+  const effectiveDuration = duration && duration > 0 ? duration : lastCueEnd;
+
+  const { targetWindowCount, minWindowSeconds, maxWindowSeconds, overlapFraction, minOverlapSeconds } =
+    DEFAULT_TRANSCRIPT_WINDOWING;
+  const windowSeconds = clamp(
+    effectiveDuration / targetWindowCount,
+    minWindowSeconds,
+    maxWindowSeconds,
+  );
+  const overlapSeconds = Math.max(
+    minOverlapSeconds,
+    windowSeconds * overlapFraction,
+  );
+  const stride = Math.max(windowSeconds - overlapSeconds, 1);
+
+  const rawWindows: VTTCue[][] = [];
+  for (let k = 0; ; k++) {
+    const windowStart = k * stride;
+    if (windowStart > lastCueEnd) {
+      break;
+    }
+    const windowEnd = windowStart + windowSeconds;
+    // A cue intersects window k when it overlaps `[windowStart, windowEnd]`.
+    const windowCues = usableCues.filter(
+      cue => cue.startTime < windowEnd && cue.endTime > windowStart,
+    );
+    if (windowCues.length > 0) {
+      rawWindows.push(windowCues);
+    }
+    // Guard against pathological non-advancing loops (stride is >= 1, so this
+    // is belt-and-suspenders only).
+    if (stride <= 0) {
+      break;
     }
   }
-  return chunks;
+
+  // Dedupe consecutive windows that contain the exact same cue set (possible
+  // with sparse speech + overlap) to avoid a redundant API call.
+  const dedupedCueGroups: VTTCue[][] = [];
+  const cueGroupKey = (group: VTTCue[]) =>
+    group.map(cue => `${cue.startTime}:${cue.endTime}`).join("|");
+  let previousKey: string | undefined;
+  for (const group of rawWindows) {
+    const key = cueGroupKey(group);
+    if (key === previousKey) {
+      continue;
+    }
+    dedupedCueGroups.push(group);
+    previousKey = key;
+  }
+
+  // Materialise windows, applying the rare hard-char-ceiling safety split.
+  const windows: TranscriptWindow[] = [];
+  for (const group of dedupedCueGroups) {
+    const joinedLength = group.reduce(
+      (sum, cue, index) => sum + cue.text.length + (index === 0 ? 0 : 1),
+      0,
+    );
+    if (joinedLength > TRANSCRIPT_WINDOW_MAX_UTF16_CODE_UNITS) {
+      windows.push(...splitCuesUnderCharCeiling(group));
+    } else {
+      windows.push({
+        startTime: Math.min(...group.map(cue => cue.startTime)),
+        endTime: Math.max(...group.map(cue => cue.endTime)),
+        text: group.map(cue => cue.text).join(" "),
+      });
+    }
+  }
+
+  return windows;
+}
+
+/** A batch of transcript windows sent in a single array-`input` request. */
+interface TranscriptModerationBatch {
+  windows: TranscriptWindow[];
+  model: string;
+  credentials?: WorkflowCredentialsInput;
+}
+
+/**
+ * Pack windows into batches whose combined text stays under
+ * {@link TRANSCRIPT_BATCH_MAX_UTF16_CODE_UNITS} and whose item count stays
+ * under {@link TRANSCRIPT_BATCH_MAX_ITEMS}. A single window larger than the
+ * batch budget still occupies its own batch.
+ */
+function packWindowsIntoBatches(windows: TranscriptWindow[]): TranscriptWindow[][] {
+  const batches: TranscriptWindow[][] = [];
+  let current: TranscriptWindow[] = [];
+  let currentLength = 0;
+
+  for (const window of windows) {
+    const wouldExceedChars =
+      current.length > 0 && currentLength + window.text.length > TRANSCRIPT_BATCH_MAX_UTF16_CODE_UNITS;
+    const wouldExceedItems = current.length >= TRANSCRIPT_BATCH_MAX_ITEMS;
+    if (wouldExceedChars || wouldExceedItems) {
+      batches.push(current);
+      current = [];
+      currentLength = 0;
+    }
+    current.push(window);
+    currentLength += window.text.length;
+  }
+  if (current.length > 0) {
+    batches.push(current);
+  }
+
+  return batches;
+}
+
+function transcriptErrorScore(
+  window: TranscriptWindow,
+  error: unknown,
+): TranscriptModerationScore {
+  return {
+    startTime: window.startTime,
+    endTime: window.endTime,
+    sexual: 0,
+    violence: 0,
+    error: true,
+    errorMessage: error instanceof Error ? error.message : String(error),
+  };
+}
+
+/**
+ * Moderate a batch of transcript windows in a single array-`input` request,
+ * mapping each `results[i]` back to window `i`. A response with a different
+ * number of results than windows is rejected by {@link callOpenAIModerationApi}
+ * and fails the whole batch, since it cannot be mapped back reliably.
+ *
+ * Fallback: if the request fails with a 400 (too large) and the batch holds
+ * more than one window, split the batch in half and retry each half
+ * recursively (down to a single window). 429/5xx are handled by the existing
+ * retry/backoff inside {@link callOpenAIModerationApi}. A window that still
+ * fails yields an error `TranscriptModerationScore` carrying its timecodes.
+ */
+async function moderateTranscriptBatchWithOpenAI(
+  batch: TranscriptModerationBatch,
+): Promise<TranscriptModerationScore[]> {
+  "use step";
+  const { windows, model, credentials } = batch;
+  if (windows.length === 0) {
+    return [];
+  }
+
+  try {
+    const { results } = await callOpenAIModerationApi({
+      model,
+      input: windows.map(window => window.text),
+      credentials,
+    });
+    return windows.map((window, index) => {
+      const result = results[index];
+      return {
+        startTime: window.startTime,
+        endTime: window.endTime,
+        sexual: result.category_scores.sexual ?? 0,
+        violence: result.category_scores.violence ?? 0,
+        error: false,
+      };
+    });
+  } catch (error) {
+    const status =
+      error instanceof OpenAIModerationRequestError ? error.status : undefined;
+    // 400 typically means the batched input was too large: split and retry.
+    if (status === 400 && windows.length > 1) {
+      const mid = Math.ceil(windows.length / 2);
+      const [left, right] = await Promise.all([
+        moderateTranscriptBatchWithOpenAI({ windows: windows.slice(0, mid), model, credentials }),
+        moderateTranscriptBatchWithOpenAI({ windows: windows.slice(mid), model, credentials }),
+      ]);
+      return [...left, ...right];
+    }
+    console.error("OpenAI transcript moderation failed:", error);
+    return windows.map(window => transcriptErrorScore(window, error));
+  }
 }
 
 async function requestOpenAITranscriptModeration(
-  transcriptText: string,
+  cues: VTTCue[],
+  duration: number,
   model: string,
   maxConcurrent: number = 5,
   credentials?: WorkflowCredentialsInput,
-): Promise<ThumbnailModerationScore[]> {
+): Promise<TranscriptModerationScore[]> {
   "use step";
-  // OpenAI supports larger inputs, but chunking avoids pathological single-request sizes and
-  // mirrors our "max over segments" behavior used for thumbnail moderation.
-  const chunks = chunkTextByUtf16CodeUnits(transcriptText, 10_000);
-  if (!chunks.length) {
-    return [
-      { url: "transcript:0", sexual: 0, violence: 0, error: true, errorMessage: "No transcript chunks to moderate" },
-    ];
+  // Build dynamic, overlapping time windows whose size scales with the asset's
+  // duration, then moderate them as array-batched requests. Each window maps to
+  // a score carrying its timecodes, mirroring the "max over segments" behavior
+  // used for thumbnail moderation. Consecutive windows' [startTime, endTime]
+  // ranges may overlap by design.
+  const windows = buildTranscriptWindows(cues, duration);
+  if (!windows.length) {
+    return [];
   }
-  const targets = chunks.map((chunk, idx) => ({
-    chunk,
-    url: `transcript:${idx}`,
-  }));
-  return processConcurrently(
-    targets,
-    async entry => requestOpenAITextModeration(entry.chunk, model, entry.url, credentials),
+  const batches: TranscriptModerationBatch[] = packWindowsIntoBatches(windows).map(
+    windowBatch => ({ windows: windowBatch, model, credentials }),
+  );
+  // Keep using the existing concurrency across BATCHES.
+  const batchResults = await processConcurrently(
+    batches,
+    moderateTranscriptBatchWithOpenAI,
     maxConcurrent,
   );
+  return batchResults.flat();
 }
 
 function getHiveCategoryScores(
@@ -760,10 +1155,49 @@ async function getThumbnailUrlsFromTimestamps(
   return Promise.all(urlPromises);
 }
 
+/** Route thumbnail moderation to the selected provider's step. */
+async function requestThumbnailModeration(
+  provider: ModerationProvider,
+  thumbnailUrls: Array<{ url: string; time: number }>,
+  options: {
+    model?: string;
+    maxConcurrent: number;
+    imageSubmissionMode: ImageSubmissionMode;
+    imageDownloadOptions?: ImageDownloadOptions;
+    credentials?: WorkflowCredentialsInput;
+  },
+): Promise<ThumbnailModerationScore[]> {
+  const { model, maxConcurrent, imageSubmissionMode, imageDownloadOptions, credentials } = options;
+  switch (provider) {
+    case "openai":
+      return requestOpenAIModeration(
+        thumbnailUrls,
+        model || "omni-moderation-latest",
+        maxConcurrent,
+        imageSubmissionMode,
+        imageDownloadOptions,
+        credentials,
+      );
+    case "hive":
+      return requestHiveModeration(thumbnailUrls, maxConcurrent, imageSubmissionMode, imageDownloadOptions, credentials);
+    case "google-vision-api":
+      return requestGoogleVisionModeration(thumbnailUrls, maxConcurrent, imageSubmissionMode, imageDownloadOptions, credentials);
+    default: {
+      const exhaustiveCheck: never = provider;
+      throw new Error(`Unsupported moderation provider: ${exhaustiveCheck}`);
+    }
+  }
+}
+
 /**
- * Moderate a Mux asset.
- * - Video assets: moderates storyboard thumbnails (image moderation)
- * - Audio-only assets: moderates transcript text (text moderation)
+ * Moderate a Mux asset. By default both surfaces are moderated where available:
+ * - Thumbnails: sampled storyboard frames (image moderation). Skipped for audio-only assets.
+ * - Transcript: caption text in time windows (text moderation). Skipped when no
+ *   usable caption track exists or the provider is image-only.
+ *
+ * Each surface reports its outcome in `thumbnailModeration` / `transcriptModeration`.
+ * Throws when neither surface can be moderated, since a result with nothing
+ * scored would read as "clean".
  *
  * Provider notes:
  * - provider 'openai' uses OpenAI's hosted moderation endpoint (requires OPENAI_API_KEY)
@@ -823,10 +1257,6 @@ export async function getModerationScores(
       } :
     undefined;
 
-  if (!isAudioOnly && renderableScope && renderableScope.startTime >= renderableScope.endTime) {
-    throw new Error("The requested scope does not include any renderable video.");
-  }
-
   // Resolve signing context for signed playback IDs
   const signingContext = await resolveMuxSigningContext(credentials);
   if (policy === "signed" && !signingContext) {
@@ -836,36 +1266,28 @@ export async function getModerationScores(
     );
   }
 
-  let thumbnailScores: ThumbnailModerationScore[];
-  let mode: ModerationResult["mode"] = "thumbnails";
-  let thumbnailCount: number | undefined;
+  // Resolve what each surface will do BEFORE any provider call, so a request
+  // that ends up with nothing to moderate fails without spending API calls,
+  // and so both surfaces can then run in parallel.
 
+  let thumbnailModeration: ThumbnailModerationStatus = { status: "completed" };
+  let thumbnailUrls: Array<{ url: string; time: number }> = [];
+  let shouldRunThumbnails = false;
   if (isAudioOnly) {
-    mode = "transcript";
-    const transcriptResult = await fetchTranscriptForAsset(asset, playbackId, {
-      languageCode,
-      cleanTranscript: true,
-      shouldSign: policy === "signed",
-      credentials,
-      required: true,
-      scope: effectiveScope,
-    });
-
-    if (provider === "openai") {
-      thumbnailScores = await requestOpenAITranscriptModeration(
-        transcriptResult.transcriptText,
-        model || "omni-moderation-latest",
-        maxConcurrent,
-        credentials,
-      );
-    } else if (provider === "hive") {
-      throw new Error("Hive does not support transcript moderation in this workflow. Use provider: 'openai' for audio-only assets.");
-    } else if (provider === "google-vision-api") {
-      throw new Error("google-vision-api is image-only and does not support transcript moderation. Use provider: 'openai' for audio-only assets.");
-    } else {
-      const exhaustiveCheck: never = provider;
-      throw new Error(`Unsupported moderation provider: ${exhaustiveCheck}`);
-    }
+    thumbnailModeration = {
+      status: "skipped",
+      skipReason: "no_video_track",
+      skipMessage: "Asset has no video track, so there are no thumbnails to moderate.",
+    };
+  } else if (renderableScope && renderableScope.startTime >= renderableScope.endTime) {
+    // The scope sits entirely in trailing non-video media (asset duration
+    // exceeds the video track). Nothing to sample, but caption cues can still
+    // exist there, so this is a skip rather than a failure.
+    thumbnailModeration = {
+      status: "skipped",
+      skipReason: "no_video_in_scope",
+      skipMessage: "The requested scope does not include any renderable video, so there are no thumbnails to moderate.",
+    };
   } else {
     // Cheaply estimate how many thumbnails the interval would produce so we
     // can skip generating (and potentially JWT-signing) URLs we'd discard.
@@ -877,7 +1299,7 @@ export async function getModerationScores(
     // maxSamples acts as a true cap: if the interval already fits within the
     // budget we use the interval-based path. Only when the interval would
     // produce more thumbnails than allowed do we switch to the sampling plan.
-    const thumbnailUrls =
+    thumbnailUrls =
       maxSamples !== undefined && estimatedIntervalCount > maxSamples ?
           await getThumbnailUrlsFromTimestamps(
             playbackId,
@@ -908,79 +1330,190 @@ export async function getModerationScores(
             credentials,
             scope: renderableScope,
           });
-    thumbnailCount = thumbnailUrls.length;
+    shouldRunThumbnails = true;
+  }
 
-    if (provider === "openai") {
-      thumbnailScores = await requestOpenAIModeration(
-        thumbnailUrls,
-        model || "omni-moderation-latest",
-        maxConcurrent,
-        imageSubmissionMode,
-        imageDownloadOptions,
-        credentials,
-      );
-    } else if (provider === "hive") {
-      thumbnailScores = await requestHiveModeration(
-        thumbnailUrls,
-        maxConcurrent,
-        imageSubmissionMode,
-        imageDownloadOptions,
-        credentials,
-      );
-    } else if (provider === "google-vision-api") {
-      thumbnailScores = await requestGoogleVisionModeration(
-        thumbnailUrls,
-        maxConcurrent,
-        imageSubmissionMode,
-        imageDownloadOptions,
-        credentials,
-      );
+  let transcriptModeration: TranscriptModerationStatus = { status: "completed" };
+  let transcriptCues: VTTCue[] = [];
+  let shouldRunTranscript = false;
+  const captionTrack = provider === "openai" ? findCaptionTrack(asset, languageCode) : undefined;
+  if (provider !== "openai") {
+    transcriptModeration = {
+      status: "skipped",
+      skipReason: "unsupported_provider",
+      skipMessage: `Provider '${provider}' is image-only and cannot moderate transcript text; use provider 'openai'.`,
+    };
+  } else if (!captionTrack) {
+    transcriptModeration = {
+      status: "skipped",
+      skipReason: "no_ready_text_track",
+      skipMessage: languageCode ?
+        `No ready caption/subtitle track found for language '${languageCode}'.` :
+        "No ready caption/subtitle track found for this asset.",
+    };
+  } else {
+    if (!captionTrack.id) {
+      throw new MuxAiError("Transcript track is missing an id.", { type: "validation_error" });
+    }
+    // Fetch the raw VTT (cleanTranscript: false) so per-cue timecodes survive
+    // for time-window segmentation. An empty transcript is a skip; a failed
+    // fetch propagates.
+    const transcriptUrl = await buildTranscriptUrl(playbackId, captionTrack.id, policy === "signed", credentials);
+    const { transcriptText, emptyReason } = await fetchTranscriptDataForUrl(transcriptUrl, {
+      cleanTranscript: false,
+      scope: effectiveScope,
+    });
+
+    if (emptyReason) {
+      transcriptModeration = {
+        status: "skipped",
+        skipReason: "no_cues",
+        skipMessage: emptyReason === "no_scoped_cues" ?
+          "Transcript has no cues in the requested scope." :
+          "Transcript is empty.",
+      };
     } else {
-      const exhaustiveCheck: never = provider;
-      throw new Error(`Unsupported moderation provider: ${exhaustiveCheck}`);
+      // No cue cap: the text goes to a classifier, not a prompt, and a
+      // truncated cue would hide whatever follows the cut from moderation.
+      transcriptCues = parseVTTCues(transcriptText, { capCueText: false });
+      const windows = transcriptCues.length === 0 ?
+          [] :
+          buildTranscriptWindows(transcriptCues, duration);
+      if (windows.length === 0) {
+        transcriptModeration = {
+          status: "skipped",
+          skipReason: "no_cues",
+          skipMessage: "Caption track had no parseable cues.",
+        };
+      } else {
+        shouldRunTranscript = true;
+      }
     }
   }
 
-  const failed = thumbnailScores.filter(s => s.error);
-  const successful = thumbnailScores.filter(s => !s.error);
+  if (!shouldRunThumbnails && !shouldRunTranscript) {
+    // Never return a result with nothing scored: `exceedsThreshold: false`
+    // would read as "clean" to anything automating off it. Both surfaces are
+    // skipped here, and every skipMessage already ends with a period.
+    throw new MuxAiError(
+      `Nothing to moderate. Thumbnails skipped: ${thumbnailModeration.skipMessage} ` +
+      `Transcript skipped: ${transcriptModeration.skipMessage}`,
+      { type: "validation_error" },
+    );
+  }
+
+  const [thumbnailScores, transcriptScores] = await Promise.all([
+    shouldRunThumbnails ?
+        requestThumbnailModeration(provider, thumbnailUrls, {
+          model,
+          maxConcurrent,
+          imageSubmissionMode,
+          imageDownloadOptions,
+          credentials,
+        }) :
+        Promise.resolve<ThumbnailModerationScore[]>([]),
+    shouldRunTranscript ?
+        requestOpenAITranscriptModeration(
+          transcriptCues,
+          duration,
+          model || "omni-moderation-latest",
+          maxConcurrent,
+          credentials,
+        ) :
+        Promise.resolve<TranscriptModerationScore[]>([]),
+  ]);
+
+  const mode: ModerationResult["mode"] =
+    shouldRunThumbnails && shouldRunTranscript ?
+      "combined" :
+      shouldRunTranscript ?
+        "transcript" :
+        "thumbnails";
+  const thumbnailCount = shouldRunThumbnails ? thumbnailUrls.length : undefined;
+
+  // Aggregate across both surfaces (thumbnails + transcript) for the all-failed
+  // guard and for the max-score / threshold computation.
+  const allScores: Array<{ sexual: number; violence: number; error: boolean; errorMessage?: string; label: string }> = [
+    ...thumbnailScores.map(s => ({ ...s, label: s.url })),
+    ...transcriptScores.map(s => ({ ...s, error: s.error ?? false, label: `transcript window ${s.startTime}-${s.endTime}s` })),
+  ];
+  const failed = allScores.filter(s => s.error);
+  const successful = allScores.filter(s => !s.error);
   if (successful.length === 0) {
-    const details = failed.map(s => `${s.url}: ${s.errorMessage || "Unknown error"}`).join("; ");
+    const details = failed.map(s => `${s.label}: ${s.errorMessage || "Unknown error"}`).join("; ");
     throw new Error(
-      `Moderation failed for all ${thumbnailScores.length} sample(s): ${details}`,
+      `Moderation failed for all ${allScores.length} sample(s): ${details}`,
     );
   }
 
   if (failed.length > 0) {
     console.warn(
-      `Moderation had partial failures (${failed.length}/${thumbnailScores.length}); continuing with successful samples.`,
+      `Moderation had partial failures (${failed.length}/${allScores.length}); continuing with successful samples.`,
     );
   }
 
-  // Find highest scores across all thumbnails
+  // A surface that ran but scored nothing must not read as completed: its
+  // empty contribution to maxScores would look like a clean result.
+  const thumbnailsFailed = shouldRunThumbnails && thumbnailScores.length > 0 && thumbnailScores.every(s => s.error);
+  const transcriptFailed = shouldRunTranscript && transcriptScores.length > 0 && transcriptScores.every(s => s.error);
+  if (thumbnailsFailed) {
+    thumbnailModeration = {
+      status: "failed",
+      errorMessage: describeSurfaceFailure("thumbnail", thumbnailScores),
+    };
+  }
+  if (transcriptFailed) {
+    transcriptModeration = {
+      status: "failed",
+      errorMessage: describeSurfaceFailure("transcript window", transcriptScores),
+    };
+  }
+
+  // Find highest scores across both thumbnails and transcript time windows.
   const maxSexual = Math.max(...successful.map(s => s.sexual));
   const maxViolence = Math.max(...successful.map(s => s.violence));
 
   const finalThresholds = { ...DEFAULT_THRESHOLDS, ...thresholds };
-  const requestedSampleCount = thumbnailScores.length;
-  const successfulSampleCount = successful.length;
-  const failedSampleCount = failed.length;
-  const sampleCoverage = successfulSampleCount / requestedSampleCount;
-  const hasEnoughSuccessfulSamples = mode === "transcript" ||
-    successfulSampleCount >= MIN_SUCCESSFUL_THUMBNAILS_FOR_CONFIDENT_THRESHOLDING;
-  const isLowConfidence = sampleCoverage < MIN_SAMPLE_COVERAGE_FOR_CONFIDENT_THRESHOLDING ||
-    !hasEnoughSuccessfulSamples;
+  // Coverage describes how well the *thumbnails* were sampled; transcript scores
+  // now live in their own array so they never enter this denominator.
+  const coverageScores = thumbnailScores;
+  const coverageFailed = coverageScores.filter(s => s.error);
+  const coverageSuccessful = coverageScores.filter(s => !s.error);
+  const requestedSampleCount = coverageScores.length;
+  const successfulSampleCount = coverageSuccessful.length;
+  const failedSampleCount = coverageFailed.length;
+  const sampleCoverage = requestedSampleCount > 0 ? successfulSampleCount / requestedSampleCount : 0;
+  // A transcript-only result (audio-only assets) has no thumbnails to sample, so
+  // it must not be penalized for "too few thumbnails" / zero thumbnail coverage.
+  // Treat it as confident as long as at least one transcript window succeeded.
+  const hasThumbnails = requestedSampleCount > 0;
+  const hasSuccessfulTranscript = transcriptScores.some(s => !s.error);
+  let isLowConfidence: boolean;
+  if (!hasThumbnails) {
+    // Transcript-only (audio-only) path: confidence is driven by transcript success.
+    isLowConfidence = !hasSuccessfulTranscript;
+  } else {
+    const hasEnoughSuccessfulSamples =
+      successfulSampleCount >= MIN_SUCCESSFUL_THUMBNAILS_FOR_CONFIDENT_THRESHOLDING;
+    isLowConfidence = sampleCoverage < MIN_SAMPLE_COVERAGE_FOR_CONFIDENT_THRESHOLDING ||
+      !hasEnoughSuccessfulSamples ||
+      transcriptFailed;
+  }
 
   return {
     assetId,
     mode,
     isAudioOnly,
     thumbnailScores,
+    transcriptScores,
+    thumbnailModeration,
+    transcriptModeration,
     coverage: {
       requestedSampleCount,
       successfulSampleCount,
       failedSampleCount,
       sampleCoverage,
-      isPartial: failedSampleCount > 0,
+      isPartial: failed.length > 0,
       isLowConfidence,
     },
     usage: {

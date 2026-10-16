@@ -497,15 +497,29 @@ export function extractTimestampedTranscript(vttContent: string): string {
   );
 }
 
+export interface ParseVTTCuesOptions {
+  /**
+   * Truncate each cue's text to {@link MAX_CUE_TEXT_CHARS}. Defaults to
+   * `true`, which is right for any consumer that puts cue text into an LLM
+   * prompt. Pass `false` when the text goes to a classifier instead
+   * (e.g. moderation), where truncating would hide content from the check
+   * rather than defend against injection.
+   */
+  capCueText?: boolean;
+}
+
 /**
  * Parses VTT content into structured cues with timing.
  *
  * @param vttContent - Raw VTT file content
+ * @param options - See {@link ParseVTTCuesOptions}
  * @returns Array of VTT cues with start/end times and text
  */
-export function parseVTTCues(vttContent: string): VTTCue[] {
+export function parseVTTCues(vttContent: string, options: ParseVTTCuesOptions = {}): VTTCue[] {
   if (!vttContent.trim())
     return [];
+
+  const { capCueText = true } = options;
 
   const lines = vttContent.split("\n");
   const cues: VTTCue[] = [];
@@ -556,15 +570,16 @@ export function parseVTTCues(vttContent: string): VTTCue[] {
         .filter(Boolean);
 
       if (textLines.length > 0) {
+        const sanitized = sanitizeUntrustedText(textLines.join(" "));
         cues.push({
           startTime,
           endTime,
           // Sanitize at the cue boundary so every downstream consumer
           // (engagement-insights, translate-captions chunked path, etc.)
           // receives text free of invisible / bidi obfuscation. Length-
-          // cap the result so an adversarially oversized cue cannot
-          // smuggle a large injection payload into the prompt.
-          text: capCueTextLength(sanitizeUntrustedText(textLines.join(" "))),
+          // cap the result by default so an adversarially oversized cue
+          // cannot smuggle a large injection payload into a prompt.
+          text: capCueText ? capCueTextLength(sanitized) : sanitized,
         });
       }
 
@@ -765,26 +780,30 @@ export async function buildTranscriptUrl(
   return baseUrl;
 }
 
-interface TranscriptFetchStepResult {
+/**
+ * Why a fetched transcript had nothing usable:
+ * - `"empty_body"` — the VTT had no text at all.
+ * - `"no_scoped_cues"` — the VTT had cues, but none inside the requested `scope`.
+ */
+export type TranscriptEmptyReason = "empty_body" | "no_scoped_cues";
+
+export interface TranscriptFetchStepResult {
   transcriptText: string;
-  /**
-   * Set when `transcriptText` came back empty. Never part of the public
-   * `TranscriptResult` shape returned to callers — internal to this module.
-   */
-  emptyReason?: "empty_body" | "no_scoped_cues";
+  /** Set when `transcriptText` came back empty. */
+  emptyReason?: TranscriptEmptyReason;
 }
 
 /**
- * Does the actual network fetch and VTT parsing for an already-resolved
- * transcript URL. Deliberately never throws a customer-safe error for "no
- * usable transcript" itself — the {@link fetchTranscriptForAsset} wrapper
- * handles propagating errors.
+ * Fetches and parses the VTT at an already-resolved transcript URL (see
+ * {@link buildTranscriptUrl}). An empty transcript is reported through
+ * `emptyReason` rather than thrown, so callers decide whether that is an
+ * error or a skip; {@link fetchTranscriptForAsset} is the wrapper that turns
+ * it into a customer-safe error when `required`.
  *
- * Still throws (uncaught) on a transient HTTP/network failure while
- * fetching the VTT file, so Workflow DevKit's normal step-retry applies to
- * that specific, genuinely-transient case.
+ * Throws on an HTTP/network failure while fetching the VTT file, so Workflow
+ * DevKit's normal step-retry applies to that genuinely-transient case.
  */
-async function fetchTranscriptDataForUrl(
+export async function fetchTranscriptDataForUrl(
   transcriptUrl: string,
   options: Pick<TranscriptFetchOptions, "cleanTranscript" | "scope"> = {},
 ): Promise<TranscriptFetchStepResult> {
