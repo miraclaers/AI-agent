@@ -275,8 +275,6 @@ import { workflows, primitives } from "@mux/ai";
 
 We welcome contributions! Please see the [Contributing Guide](./CONTRIBUTING.md) for details on setting up your development environment, running tests, and submitting pull requests.
 
-For questions or discussions, feel free to [open an issue](https://github.com/muxinc/ai/issues).
-
 ## License
 
 [Apache 2.0](LICENSE)
